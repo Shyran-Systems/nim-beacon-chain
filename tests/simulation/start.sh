@@ -44,10 +44,10 @@ type "$MULTITAIL" &>/dev/null || { echo "${MULTITAIL}" is missing; USE_MULTITAIL
 USE_TMUX="${USE_TMUX:-no}"
 type "$TMUX" &>/dev/null || { echo "${TMUX}" is missing; USE_TMUX="no"; }
 
-USE_GANACHE="${USE_GANACHE:-no}"
+USE_GANACHE="${USE_GANACHE:-yes}"
 type "$GANACHE" &>/dev/null || { echo $GANACHE is missing; USE_GANACHE="no"; }
 
-USE_PROMETHEUS="${LAUNCH_PROMETHEUS:-no}"
+USE_PROMETHEUS="${LAUNCH_PROMETHEUS:-yes}"
 type "$PROMETHEUS" &>/dev/null || { echo $PROMETHEUS is missing; USE_PROMETHEUS="no"; }
 
 ./scripts/make_prometheus_config.sh \
@@ -74,10 +74,9 @@ fi
 if [[ "$USE_GANACHE" != "no" ]]; then
   if [[ "$USE_TMUX" != "no" ]]; then
     $TMUX new-window -d -t $TMUX_SESSION_NAME -n "$GANACHE" "$GANACHE"
-  elif [[ "$USE_MULTITAIL" != "no" ]]; then
-    COMMANDS+=( " -cT ansi -t '$GANACHE'" )
   else
-    $GANACHE &
+    echo NOTICE: $GANACHE will be started automatically only with USE_TMUX=1
+    USE_GANACHE="no"
   fi
 fi
 
@@ -85,7 +84,8 @@ if [[ "$USE_PROMETHEUS" != "no" ]]; then
   if [[ "$USE_TMUX" != "no" ]]; then
     $TMUX new-window -d -t $TMUX_SESSION_NAME -n "$PROMETHEUS" "cd '$METRICS_DIR' && $PROMETHEUS"
   else
-    echo "$PROMETHEUS can be used currently only with USE_TMUX=1"
+    echo NOTICE: $PROMETHEUS will be started automatically only with USE_TMUX=1
+    USE_PROMETHEUS="no"
   fi
 fi
 
