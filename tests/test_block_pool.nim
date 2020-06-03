@@ -10,7 +10,7 @@
 import
   options, sequtils, unittest,
   ./testutil, ./testblockutil,
-  ../beacon_chain/spec/[datatypes, digest, helpers],
+  ../beacon_chain/spec/[datatypes, digest],
   ../beacon_chain/[beacon_node_types, block_pool, state_transition, ssz]
 
 suiteReport "BlockRef and helpers" & preset():
@@ -277,7 +277,7 @@ suiteReport "Block pool processing" & preset():
       tmpState.data.data.slot == bs1.parent.slot
 
 when const_preset == "minimal":  # These require some minutes in mainnet
-  import ../beacon_chain/spec/validator
+  import ../beacon_chain/spec/[helpers, validator]
 
   suiteReport "BlockPool finalization tests" & preset():
     setup:
