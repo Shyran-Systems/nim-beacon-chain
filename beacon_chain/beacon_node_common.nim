@@ -21,7 +21,8 @@ import
   ssz/merkleization,
   attestation_pool, block_pool, eth2_network,
   beacon_node_types, mainchain_monitor, request_manager,
-  sync_manager
+  sync_manager,
+  fork_choice/fork_choice
 
 # This removes an invalid Nim warning that the digest module is unused here
 # It's currently used for `shortLog(head.blck.root)`
@@ -118,6 +119,9 @@ proc storeBlock*(
             dump(node.config.dumpDir / "invalid", signedBlock, blockRoot)
 
     return err(blck.error)
+  # Still here? This means we received a valid block and we need to add it
+  # to the fork choice
+  node.attestationPool.add(blck.get())
 
   # The block we received contains attestations, and we might not yet know about
   # all of them. Let's add them to the attestation pool - in case they block
@@ -147,6 +151,9 @@ proc updateHead*(node: BeaconNode): BlockRef =
   # justified and finalized
   node.blockPool.updateHead(newHead)
   beacon_head_root.set newHead.root.toGaugeValue
+
+  # Cleanup the fork choice if we have a finalized head
+  node.attestationPool.pruneBefore(node.blockPool.finalizedHead)
 
   newHead
 
