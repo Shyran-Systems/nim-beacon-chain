@@ -1,10 +1,11 @@
 import
   # Std lib
   typetraits, strutils, os, random, algorithm, sequtils,
-  options as stdOptions, net as stdNet,
+  options as stdOptions,
 
   # Status libs
-  stew/[varints, base58, bitseqs, endians2, results, byteutils],
+  stew/[varints, base58, endians2, results, byteutils],
+  stew/shims/net as stewNet,
   stew/shims/[macros, tables],
   faststreams/[inputs, outputs, buffers], snappy, snappy/framing,
   json_serialization, json_serialization/std/[net, options],
@@ -20,12 +21,13 @@ import
   eth/[keys, async_utils], eth/p2p/p2p_protocol_dsl,
   eth/net/nat, eth/p2p/discoveryv5/[enr, node],
   # Beacon node modules
-  version, conf, eth2_discovery, libp2p_json_serialization, conf, ssz,
+  version, conf, eth2_discovery, libp2p_json_serialization, conf,
+  ssz/ssz_serialization,
   peer_pool, spec/[datatypes, network]
 
 export
   version, multiaddress, peer_pool, peerinfo, p2pProtocol,
-  libp2p_json_serialization, ssz, peer, results
+  libp2p_json_serialization, ssz_serialization, peer, results
 
 logScope:
   topics = "networking"
@@ -42,6 +44,10 @@ type
   # warning about unused import (rpc/messages).
   GossipMsg = messages.Message
 
+  SeenItem* = object
+    pinfo*: PeerInfo
+    stamp*: chronos.Moment
+
   # TODO Is this really needed?
   Eth2Node* = ref object of RootObj
     switch*: Switch
@@ -52,6 +58,11 @@ type
     libp2pTransportLoops*: seq[Future[void]]
     discoveryLoop: Future[void]
     metadata*: Eth2Metadata
+    connectTimeout*: chronos.Duration
+    seenThreshold*: chronos.Duration
+    connQueue: AsyncQueue[PeerInfo]
+    seenTable: Table[PeerID, SeenItem]
+    connWorkers: seq[Future[void]]
 
   EthereumNode = Eth2Node # needed for the definitions in p2p_backends_helpers
 
@@ -189,6 +200,9 @@ const
   PeerScoreHighLimit* = 1000
     ## Max value of peer's score
 
+  ConcurrentConnections* = 10
+    ## Maximum number of active concurrent connection requests.
+
 template neterr(kindParam: Eth2NetworkingErrorKind): auto =
   err(type(result), Eth2NetworkingError(kind: kindParam))
 
@@ -201,6 +215,12 @@ declareCounter gossip_messages_received,
 
 declarePublicGauge libp2p_successful_dials,
   "Number of successfully dialed peers"
+
+declarePublicGauge libp2p_failed_dials,
+  "Number of dialing attempts that failed"
+
+declarePublicGauge libp2p_timeout_dials,
+  "Number of dialing attempts that exceeded timeout"
 
 declarePublicGauge libp2p_peers,
   "Number of active libp2p peers"
@@ -338,12 +358,22 @@ template errorMsgLit(x: static string): ErrorMsg =
   const val = ErrorMsg toBytes(x)
   val
 
+proc formatErrorMsg(msg: ErrorMSg): string =
+  let candidate = string.fromBytes(asSeq(msg))
+  for c in candidate:
+    # TODO UTF-8 - but let's start with ASCII
+    if ord(c) < 32 or ord(c) > 127:
+      return byteutils.toHex(asSeq(msg))
+
+  return candidate
+
 proc sendErrorResponse(peer: Peer,
                        conn: Connection,
                        noSnappy: bool,
                        responseCode: ResponseCode,
                        errMsg: ErrorMsg) {.async.} =
-  debug "Error processing request", peer, responseCode, errMsg
+  debug "Error processing request",
+    peer, responseCode, errMsg = formatErrorMsg(errMsg)
   await conn.writeChunk(some responseCode, SSZ.encode(errMsg), noSnappy)
 
 proc sendNotificationMsg(peer: Peer, protocolId: string, requestBytes: Bytes) {.async} =
@@ -627,17 +657,15 @@ proc toPeerInfo*(r: enr.TypedRecord): PeerInfo =
     var addresses = newSeq[MultiAddress]()
 
     if r.ip.isSome and r.tcp.isSome:
-      let ip = IpAddress(family: IpAddressFamily.IPv4,
-                         address_v4: r.ip.get)
-      addresses.add MultiAddress.init(ip, TCP, Port r.tcp.get)
+      let ip = ipv4(r.ip.get)
+      addresses.add MultiAddress.init(ip, tcpProtocol, Port r.tcp.get)
 
     if r.ip6.isSome:
-      let ip = IpAddress(family: IpAddressFamily.IPv6,
-                         address_v6: r.ip6.get)
+      let ip = ipv6(r.ip6.get)
       if r.tcp6.isSome:
-        addresses.add MultiAddress.init(ip, TCP, Port r.tcp6.get)
+        addresses.add MultiAddress.init(ip, tcpProtocol, Port r.tcp6.get)
       elif r.tcp.isSome:
-        addresses.add MultiAddress.init(ip, TCP, Port r.tcp.get)
+        addresses.add MultiAddress.init(ip, tcpProtocol, Port r.tcp.get)
       else:
         discard
 
@@ -648,26 +676,70 @@ proc toPeerInfo(r: Option[enr.TypedRecord]): PeerInfo =
   if r.isSome:
     return r.get.toPeerInfo
 
+proc isSeen*(network: ETh2Node, pinfo: PeerInfo): bool =
+  let currentTime = now(chronos.Moment)
+  let item = network.seenTable.getOrDefault(pinfo.peerId)
+  if isNil(item.pinfo):
+    # Peer is not in SeenTable.
+    return false
+  if currentTime - item.stamp >= network.seenThreshold:
+    network.seenTable.del(pinfo.peerId)
+    return false
+  return true
+
+proc addSeen*(network: ETh2Node, pinfo: PeerInfo) =
+  let item = SeenItem(pinfo: pinfo, stamp: now(chronos.Moment))
+  network.seenTable[pinfo.peerId] = item
+
 proc dialPeer*(node: Eth2Node, peerInfo: PeerInfo) {.async.} =
   logScope: peer = $peerInfo
 
   debug "Connecting to peer"
-  if await withTimeout(node.switch.connect(peerInfo), 10.seconds):
-    var peer = node.getPeer(peerInfo)
-    peer.wasDialed = true
+  await node.switch.connect(peerInfo)
+  var peer = node.getPeer(peerInfo)
+  peer.wasDialed = true
 
-    #let msDial = newMultistream()
-    #let conn = node.switch.connections.getOrDefault(peerInfo.id)
-    #let ls = await msDial.list(conn)
-    #debug "Supported protocols", ls
+  #let msDial = newMultistream()
+  #let conn = node.switch.connections.getOrDefault(peerInfo.id)
+  #let ls = await msDial.list(conn)
+  #debug "Supported protocols", ls
 
-    debug "Initializing connection"
-    await initializeConnection(peer)
+  debug "Initializing connection"
+  await initializeConnection(peer)
 
-    inc libp2p_successful_dials
-    debug "Network handshakes completed"
-  else:
-    debug "Connection timed out"
+  inc libp2p_successful_dials
+  debug "Network handshakes completed"
+
+proc connectWorker(network: Eth2Node) {.async.} =
+  debug "Connection worker started"
+  while true:
+    let pi = await network.connQueue.popFirst()
+    let r1 = network.peerPool.hasPeer(pi.peerId)
+    let r2 = network.isSeen(pi)
+
+    if not(r1) and not(r2):
+      # We trying to connect to peers which are not present in our PeerPool and
+      # not present in our SeenTable.
+      var fut = network.dialPeer(pi)
+      # We discarding here just because we going to check future state, to avoid
+      # condition where connection happens and timeout reached.
+      let res = await withTimeout(fut, network.connectTimeout)
+      # We handling only timeout and errors, because successfull connections
+      # will be stored in PeerPool.
+      if fut.finished():
+        if fut.failed() and not(fut.cancelled()):
+          debug "Unable to establish connection with peer", peer = $pi,
+                errMsg = fut.readError().msg
+          inc libp2p_failed_dials
+          network.addSeen(pi)
+        continue
+      debug "Connection to remote peer timed out", peer = $pi
+      inc libp2p_timeout_dials
+      network.addSeen(pi)
+    else:
+      debug "Peer is already connected or already seen", peer = $pi,
+            peer_pool_has_peer = $r1, seen_table_has_peer = $r2,
+            seen_table_size = len(network.seenTable)
 
 proc runDiscoveryLoop*(node: Eth2Node) {.async.} =
   debug "Starting discovery loop"
@@ -686,8 +758,7 @@ proc runDiscoveryLoop*(node: Eth2Node) {.async.} =
               if peerInfo != nil:
                 if peerInfo.id notin node.switch.connections:
                   debug "Discovered new peer", peer = $peer
-                  # TODO do this in parallel
-                  await node.dialPeer(peerInfo)
+                  await node.connQueue.addLast(peerInfo)
                 else:
                   peerInfo.close()
           except CatchableError as err:
@@ -709,12 +780,16 @@ proc getPersistentNetMetadata*(conf: BeaconNodeConf): Eth2Metadata =
     result = Json.loadFile(metadataPath, Eth2Metadata)
 
 proc init*(T: type Eth2Node, conf: BeaconNodeConf, enrForkId: ENRForkID,
-           switch: Switch, ip: Option[IpAddress], tcpPort, udpPort: Port,
+           switch: Switch, ip: Option[ValidIpAddress], tcpPort, udpPort: Port,
            privKey: keys.PrivateKey): T =
   new result
   result.switch = switch
   result.wantedPeers = conf.maxPeers
   result.peerPool = newPeerPool[Peer, PeerID](maxPeers = conf.maxPeers)
+  result.connectTimeout = 10.seconds
+  result.seenThreshold = 10.minutes
+  result.seenTable = initTable[PeerID, SeenItem]()
+  result.connQueue = newAsyncQueue[PeerInfo](ConcurrentConnections)
   result.metadata = getPersistentNetMetadata(conf)
   result.discovery = Eth2DiscoveryProtocol.new(
     conf, ip, tcpPort, udpPort, privKey.toRaw,
@@ -728,6 +803,9 @@ proc init*(T: type Eth2Node, conf: BeaconNodeConf, enrForkId: ENRForkID,
     for msg in proto.messages:
       if msg.protocolMounter != nil:
         msg.protocolMounter result
+
+  for i in 0 ..< ConcurrentConnections:
+    result.connWorkers.add(connectWorker(result))
 
 template publicKey*(node: Eth2Node): keys.PublicKey =
   node.discovery.privKey.toPublicKey.tryGet()
@@ -907,7 +985,7 @@ proc p2pProtocolBackendImpl*(p: P2PProtocol): Backend =
   result.implementProtocolInit = proc (p: P2PProtocol): NimNode =
     return newCall(initProtocol, newLit(p.name), p.peerInit, p.netInit)
 
-proc setupNat(conf: BeaconNodeConf): tuple[ip: Option[IpAddress],
+proc setupNat(conf: BeaconNodeConf): tuple[ip: Option[ValidIpAddress],
                                            tcpPort: Port,
                                            udpPort: Port] {.gcsafe.} =
   # defaults
@@ -925,17 +1003,22 @@ proc setupNat(conf: BeaconNodeConf): tuple[ip: Option[IpAddress],
     of "pmp":
       nat = NatPmp
     else:
-      if conf.nat.startsWith("extip:") and isIpAddress(conf.nat[6..^1]):
-        # any required port redirection is assumed to be done by hand
-        result.ip = some(parseIpAddress(conf.nat[6..^1]))
-        nat = NatNone
+      if conf.nat.startsWith("extip:"):
+        try:
+          # any required port redirection is assumed to be done by hand
+          result.ip = some(ValidIpAddress.init(conf.nat[6..^1]))
+          nat = NatNone
+        except ValueError:
+          error "nor a valid IP address", address = conf.nat[6..^1]
+          quit QuitFailure
       else:
-        error "not a valid NAT mechanism, nor a valid IP address", value = conf.nat
-        quit(QuitFailure)
+        error "not a valid NAT mechanism", value = conf.nat
+        quit QuitFailure
 
   if nat != NatNone:
-    result.ip = getExternalIP(nat)
-    if result.ip.isSome:
+    let extIp = getExternalIP(nat)
+    if extIP.isSome:
+      result.ip = some(ValidIpAddress.init extIp.get)
       # TODO redirectPorts in considered a gcsafety violation
       # because it obtains the address of a non-gcsafe proc?
       let extPorts = ({.gcsafe.}:
@@ -960,7 +1043,7 @@ proc initAddress*(T: type MultiAddress, str: string): T =
                        "Invalid bootstrap node multi-address")
 
 template tcpEndPoint(address, port): auto =
-  MultiAddress.init(address, Protocol.IPPROTO_TCP, port)
+  MultiAddress.init(address, tcpProtocol, port)
 
 proc getPersistentNetKeys*(conf: BeaconNodeConf): KeyPair =
   let
@@ -1000,7 +1083,7 @@ proc createEth2Node*(conf: BeaconNodeConf, enrForkId: ENRForkID): Future[Eth2Nod
                          keys.seckey.asEthKey)
 
 proc getPersistenBootstrapAddr*(conf: BeaconNodeConf,
-                                ip: IpAddress, port: Port): EnrResult[enr.Record] =
+                                ip: ValidIpAddress, port: Port): EnrResult[enr.Record] =
   let pair = getPersistentNetKeys(conf)
   return enr.Record.init(1'u64, # sequence number
                          pair.seckey.asEthKey,

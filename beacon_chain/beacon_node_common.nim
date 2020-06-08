@@ -18,8 +18,10 @@ import
   # Local modules
   spec/[datatypes, crypto, digest, helpers],
   conf, time, beacon_chain_db, sszdump,
+  ssz/merkleization,
   attestation_pool, block_pool, eth2_network,
-  beacon_node_types, mainchain_monitor, request_manager
+  beacon_node_types, mainchain_monitor, request_manager,
+  sync_manager
 
 # This removes an invalid Nim warning that the digest module is unused here
 # It's currently used for `shortLog(head.blck.root)`
@@ -42,9 +44,11 @@ type
     beaconClock*: BeaconClock
     rpcServer*: RpcServer
     forkDigest*: ForkDigest
+    syncManager*: SyncManager[Peer, PeerID]
     topicBeaconBlocks*: string
     topicAggregateAndProofs*: string
-    syncLoop*: Future[void]
+    forwardSyncLoop*: Future[void]
+    onSecondLoop*: Future[void]
 
 const
   MaxEmptySlotCount* = uint64(10*60) div SECONDS_PER_SLOT
@@ -103,7 +107,17 @@ proc storeBlock*(
     dump(node.config.dumpDir / "incoming", signedBlock, blockRoot)
 
   beacon_blocks_received.inc()
-  discard ? node.blockPool.add(blockRoot, signedBlock)
+  let blck = node.blockPool.add(blockRoot, signedBlock)
+  if blck.isErr:
+    if blck.error == Invalid and node.config.dumpEnabled:
+      let parent = node.blockPool.getRef(signedBlock.message.parent_root)
+      if parent != nil:
+        node.blockPool.withState(
+          node.blockPool.tmpState, parent.atSlot(signedBlock.message.slot - 1)):
+            dump(node.config.dumpDir / "invalid", hashedState, parent)
+            dump(node.config.dumpDir / "invalid", signedBlock, blockRoot)
+
+    return err(blck.error)
 
   # The block we received contains attestations, and we might not yet know about
   # all of them. Let's add them to the attestation pool - in case they block

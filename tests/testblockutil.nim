@@ -8,7 +8,8 @@
 import
   options, stew/endians2,
   chronicles, eth/trie/[db],
-  ../beacon_chain/[beacon_chain_db, block_pool, extras, merkle_minimal, ssz,
+  ../beacon_chain/[beacon_chain_db, block_pool, extras, merkle_minimal,
+  ../beacon_chain/ssz/merkleization,
     state_transition, validator_pool],
   ../beacon_chain/spec/[beaconstate, crypto, datatypes, digest,
     helpers, validator, state_transition_block]
@@ -88,13 +89,13 @@ func signBlock*(
 proc addTestBlock*(
     state: var HashedBeaconState,
     parent_root: Eth2Digest,
+    cache: var StateCache,
     eth1_data = Eth1Data(),
     attestations = newSeq[Attestation](),
     deposits = newSeq[Deposit](),
     graffiti = Eth2Digest(),
     flags: set[UpdateFlag] = {}): SignedBeaconBlock =
   # Create and add a block to state - state will advance by one slot!
-  var cache = get_empty_per_epoch_cache()
   advance_slot(state, err(Opt[Eth2Digest]), flags, cache)
 
   let
@@ -121,7 +122,8 @@ proc addTestBlock*(
       graffiti,
       attestations,
       deposits,
-      noRollback)
+      noRollback,
+      cache)
 
   doAssert message.isSome(), "Should have created a valid block!"
 
@@ -135,6 +137,7 @@ proc addTestBlock*(
 proc makeTestBlock*(
     state: HashedBeaconState,
     parent_root: Eth2Digest,
+    cache: var StateCache,
     eth1_data = Eth1Data(),
     attestations = newSeq[Attestation](),
     deposits = newSeq[Deposit](),
@@ -146,7 +149,8 @@ proc makeTestBlock*(
   # because the block includes the state root.
   var tmpState = newClone(state)
   addTestBlock(
-    tmpState[], parent_root, eth1_data, attestations, deposits, graffiti, flags)
+    tmpState[], parent_root, cache, eth1_data, attestations, deposits,
+    graffiti, flags)
 
 proc makeAttestation*(
     state: BeaconState, beacon_block_root: Eth2Digest,

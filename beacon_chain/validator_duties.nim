@@ -10,7 +10,7 @@ import
   os, tables, strutils,
 
   # Nimble packages
-  stew/[objects, bitseqs], stew/shims/macros,
+  stew/[byteutils, objects], stew/shims/macros,
   chronos, metrics, json_rpc/[rpcserver, jsonmarshal],
   chronicles,
   json_serialization/std/[options, sets, net], serialization/errors,
@@ -22,7 +22,7 @@ import
   conf, time, validator_pool, state_transition,
   attestation_pool, block_pool, eth2_network,
   beacon_node_common, beacon_node_types,
-  mainchain_monitor, version, ssz, interop,
+  mainchain_monitor, version, ssz/merkleization, interop,
   attestation_aggregation, sync_manager, sszdump
 
 # Metrics for tracking attestation and beacon block loss
@@ -176,6 +176,7 @@ proc makeBeaconBlockForHeadAndSlot*(node: BeaconNode,
       doAssert v.addr == addr poolPtr.tmpState.data
       poolPtr.tmpState = poolPtr.headState
 
+    var cache = get_empty_per_epoch_cache()
     let message = makeBeaconBlock(
       hashedState,
       validator_index,
@@ -185,7 +186,8 @@ proc makeBeaconBlockForHeadAndSlot*(node: BeaconNode,
       graffiti,
       node.attestationPool.getAttestationsForBlock(state),
       deposits,
-      restore)
+      restore,
+      cache)
 
     if message.isSome():
       # TODO this restore is needed because otherwise tmpState will be internally
@@ -213,8 +215,10 @@ proc proposeBlock(node: BeaconNode,
       cat = "fastforward"
     return head
 
+  var graffiti: Eth2Digest
+  graffiti.data[0..<5] = toBytes("quack")
   let valInfo = ValidatorInfoForMakeBeaconBlock(kind: viValidator, validator: validator)
-  let beaconBlockTuple = makeBeaconBlockForHeadAndSlot(node, valInfo, validator_index, Eth2Digest(), head, slot)
+  let beaconBlockTuple = makeBeaconBlockForHeadAndSlot(node, valInfo, validator_index, graffiti, head, slot)
 
   if not beaconBlockTuple.message.isSome():
     return head # already logged elsewhere!

@@ -10,7 +10,7 @@ import
   os, tables, random, strutils, times, math,
 
   # Nimble packages
-  stew/[objects, bitseqs, byteutils], stew/shims/macros,
+  stew/[objects, byteutils], stew/shims/macros,
   chronos, confutils, metrics, json_rpc/[rpcserver, jsonmarshal],
   chronicles,
   json_serialization/std/[options, sets, net], serialization/errors,
@@ -24,7 +24,7 @@ import
   attestation_pool, block_pool, eth2_network, eth2_discovery,
   beacon_node_common, beacon_node_types,
   nimbus_binary_common,
-  mainchain_monitor, version, ssz,
+  mainchain_monitor, version, ssz/[merkleization],
   sync_protocol, request_manager, validator_keygen, interop, statusbar,
   sync_manager, state_transition,
   validator_duties, validator_api
@@ -44,7 +44,7 @@ type
 # this needs to be global, so it can be set in the Ctrl+C signal handler
 var status = BeaconNodeStatus.Starting
 
-template init(T: type RpcHttpServer, ip: IpAddress, port: Port): T =
+template init(T: type RpcHttpServer, ip: ValidIpAddress, port: Port): T =
   newRpcHttpServer([initTAddress(ip, port)])
 
 # https://github.com/ethereum/eth2.0-metrics/blob/master/metrics.md#interop-metrics
@@ -436,19 +436,31 @@ proc handleMissingBlocks(node: BeaconNode) =
       #   discard setTimer(Moment.now()) do (p: pointer):
       #     handleMissingBlocks(node)
 
-proc onSecond(node: BeaconNode, moment: Moment) {.async.} =
-  node.handleMissingBlocks()
+proc onSecond(node: BeaconNode) {.async.} =
+  ## This procedure will be called once per second.
+  if not(node.syncManager.inProgress):
+    node.handleMissingBlocks()
 
-  let nextSecond = max(Moment.now(), moment + chronos.seconds(1))
-  discard setTimer(nextSecond) do (p: pointer):
-    asyncCheck node.onSecond(nextSecond)
+proc runOnSecondLoop(node: BeaconNode) {.async.} =
+  var sleepTime = chronos.seconds(1)
+  while true:
+    await chronos.sleepAsync(sleepTime)
+    let start = chronos.now(chronos.Moment)
+    await node.onSecond()
+    let finish = chronos.now(chronos.Moment)
+    debug "onSecond task completed", elapsed = $(finish - start)
+    if finish - start > chronos.seconds(1):
+      sleepTime = chronos.seconds(0)
+    else:
+      sleepTime = chronos.seconds(1) - (finish - start)
 
-proc runSyncLoop(node: BeaconNode) {.async.} =
+proc runForwardSyncLoop(node: BeaconNode) {.async.} =
   proc getLocalHeadSlot(): Slot =
     result = node.blockPool.head.blck.slot
 
   proc getLocalWallSlot(): Slot {.gcsafe.} =
-    let epoch = node.beaconClock.now().toSlot().slot.compute_epoch_at_slot() + 1'u64
+    let epoch = node.beaconClock.now().toSlot().slot.compute_epoch_at_slot() +
+                1'u64
     result = epoch.compute_start_slot_at_epoch()
 
   proc updateLocalBlocks(list: openarray[SignedBeaconBlock]): Result[void, BlockError] =
@@ -490,7 +502,7 @@ proc runSyncLoop(node: BeaconNode) {.async.} =
 
   node.network.peerPool.setScoreCheck(scoreCheck)
 
-  var syncman = newSyncManager[Peer, PeerID](
+  node.syncManager = newSyncManager[Peer, PeerID](
     node.network.peerPool, getLocalHeadSlot, getLocalWallSlot,
     updateLocalBlocks,
     # 4 blocks per chunk is the optimal value right now, because our current
@@ -501,7 +513,7 @@ proc runSyncLoop(node: BeaconNode) {.async.} =
     chunkSize = 4
   )
 
-  await syncman.sync()
+  await node.syncManager.sync()
 
 proc currentSlot(node: BeaconNode): Slot =
   node.beaconClock.now.slotOrZero
@@ -695,11 +707,8 @@ proc run*(node: BeaconNode) =
     addTimer(fromNow) do (p: pointer):
       asyncCheck node.onSlotStart(curSlot, nextSlot)
 
-    let second = Moment.now() + chronos.seconds(1)
-    discard setTimer(second) do (p: pointer):
-      asyncCheck node.onSecond(second)
-
-    node.syncLoop = runSyncLoop(node)
+    node.onSecondLoop = runOnSecondLoop(node)
+    node.forwardSyncLoop = runForwardSyncLoop(node)
 
   # main event loop
   while status == BeaconNodeStatus.Running:

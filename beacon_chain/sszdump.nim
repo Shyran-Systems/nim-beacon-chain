@@ -1,7 +1,6 @@
 import
   os, strformat,
-  ssz,
-  serialization,
+  ssz/ssz_serialization,
   beacon_node_types,
   ./spec/[crypto, datatypes, digest]
 
@@ -19,3 +18,7 @@ proc dump*(dir: string, v: HashedBeaconState, blck: BlockRef) =
     dir / &"state-{v.data.slot}-{shortLog(blck.root)}-{shortLog(v.root)}.ssz",
     v.data)
 
+proc dump*(dir: string, v: HashedBeaconState) =
+  SSZ.saveFile(
+    dir / &"state-{v.data.slot}-{shortLog(v.root)}.ssz",
+    v.data)

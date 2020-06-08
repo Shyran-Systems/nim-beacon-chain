@@ -14,7 +14,8 @@ import
   options, sequtils, random, tables,
   ../tests/[testblockutil],
   ../beacon_chain/spec/[beaconstate, crypto, datatypes, digest, helpers, validator],
-  ../beacon_chain/[attestation_pool, extras, ssz],
+  ../beacon_chain/[attestation_pool, extras],
+  ../beacon_chain/ssz/[merkleization, ssz_serialization],
   ./simutils
 
 type Timers = enum
@@ -94,7 +95,8 @@ cli do(slots = SLOTS_PER_EPOCH * 6,
 
     withTimer(timers[t]):
       signedBlock = addTestBlock(
-        state[], latest_block_root, attestations = blockAttestations, flags = flags)
+        state[], latest_block_root, cache, attestations = blockAttestations,
+        flags = flags)
     latest_block_root = withTimerRet(timers[tHashBlock]):
       hash_tree_root(signedBlock.message)
 
